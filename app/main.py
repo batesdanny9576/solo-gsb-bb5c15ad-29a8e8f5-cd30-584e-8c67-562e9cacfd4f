@@ -10,6 +10,11 @@
 409，任一越界则全部不落库；修订后参与者与公共位置按原先指向的台词
 身份重排——保留的台词跟随新位置，被删除的回退到最近仍保留的前一行，
 无前一行则置为 -1，且修订本身不产生推进记录。
+
+排练支持暂停/恢复（PUT /clock，基于 clock_version 乐观并发控制）：
+暂停期间冻结活跃成员的超时判定并拒绝位置上报（409）；恢复时把整段
+暂停时长从所有参与者的最后上报时间中顺延扣除，使暂停前剩余在线时长
+原样延续——暂停前已超时离线者不会被重新激活。
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Response
 
 from .db import connect, init_db
-from .schemas import EventReport, LinesImport, LinesPatch, RoomCreate
+from .schemas import ClockUpdate, EventReport, LinesImport, LinesPatch, RoomCreate
 
 
 def _now() -> float:
@@ -39,7 +44,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="排练提词同步 API",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -55,9 +60,21 @@ def _get_room(conn, room_id: str):
     return row
 
 
-def _active_participants(conn, room_id: str, now: float, timeout_seconds: int) -> List[Any]:
-    """离线超时内有过上报的参与者才算活跃。"""
-    cutoff = now - timeout_seconds
+def _effective_now(room, now: float) -> float:
+    """用于超时判定的“有效当前时间”。
+
+    排练进行中即真实时间；暂停期间冻结在暂停那一刻（``paused_at``），
+    因此暂停再久也不会让任何成员超时离线。
+    """
+    return room["paused_at"] if room["paused"] else now
+
+
+def _active_participants(conn, room, now: float) -> List[Any]:
+    """离线超时内有过上报的参与者才算活跃。
+
+    ``now`` 为有效当前时间（暂停时冻结在暂停时刻，见 :func:`_effective_now`）。
+    """
+    cutoff = now - room["offline_timeout_seconds"]
     return conn.execute(
         """
         SELECT participant_id, position, last_seq, last_seen_at
@@ -65,7 +82,7 @@ def _active_participants(conn, room_id: str, now: float, timeout_seconds: int) -
         WHERE room_id = ? AND last_seen_at >= ?
         ORDER BY participant_id
         """,
-        (room_id, cutoff),
+        (room["id"], cutoff),
     ).fetchall()
 
 
@@ -76,7 +93,7 @@ def _maybe_advance(conn, room, now: float) -> Optional[Dict[str, Any]]:
     最高台词”。公共位置只在算出的候选值更高时才更新，因此绝不回退。
     """
     threshold = room["advance_threshold"]
-    rows = _active_participants(conn, room["id"], now, room["offline_timeout_seconds"])
+    rows = _active_participants(conn, room, now)
     if len(rows) < threshold:
         return None
     positions = sorted((row["position"] for row in rows), reverse=True)
@@ -117,6 +134,8 @@ def _room_payload(room) -> Dict[str, Any]:
 def _state_payload(conn, room, now: float) -> Dict[str, Any]:
     room_id = room["id"]
     public_position = room["public_position"]
+    # 暂停期间超时判定冻结在暂停时刻：活跃成员集合与暂停前一致
+    effective_now = _effective_now(room, now)
 
     current_line = None
     if public_position >= 0:
@@ -134,7 +153,7 @@ def _state_payload(conn, room, now: float) -> Dict[str, Any]:
             "last_seq": row["last_seq"],
             "last_seen_at": row["last_seen_at"],
         }
-        for row in _active_participants(conn, room_id, now, room["offline_timeout_seconds"])
+        for row in _active_participants(conn, room, effective_now)
     ]
 
     last_advancement = None
@@ -168,6 +187,9 @@ def _state_payload(conn, room, now: float) -> Dict[str, Any]:
         "current_line": current_line,
         "active_participants": participants,
         "last_advancement": last_advancement,
+        "paused": bool(room["paused"]),
+        "clock_version": room["clock_version"],
+        "paused_at": room["paused_at"],
         "server_time": now,
     }
 
@@ -426,6 +448,9 @@ def report_event(room_id: str, event: EventReport) -> Dict[str, Any]:
     try:
         conn.execute("BEGIN IMMEDIATE")
         room = _get_room(conn, room_id)
+        if room["paused"]:
+            # 暂停期间冻结一切排练活动：任何位置上报（含重复/乱序重试）一律拒绝
+            raise HTTPException(status_code=409, detail="排练已暂停：暂停期间拒绝位置上报")
         lines_count = conn.execute(
             "SELECT COUNT(*) AS c FROM lines WHERE room_id = ?", (room_id,)
         ).fetchone()["c"]
@@ -481,6 +506,74 @@ def get_state(room_id: str) -> Dict[str, Any]:
     try:
         room = _get_room(conn, room_id)
         return _state_payload(conn, room, now)
+    finally:
+        conn.close()
+
+
+@app.put("/rooms/{room_id}/clock")
+def update_clock(room_id: str, payload: ClockUpdate) -> Dict[str, Any]:
+    """暂停或恢复排练（乐观并发控制，基于 ``clock_version``）。
+
+    语义：
+
+    - 目标状态与当前一致（已是该状态）：原样返回当前状态，**不增版**，
+      客户端重试同一请求是安全的；
+    - 目标状态不同且 ``expected_clock_version`` 与当前不符：返回 **409**，
+      房间状态不变；
+    - 成功切换：``clock_version`` 递增。
+
+    暂停时记录 ``paused_at`` 并冻结活跃成员超时判定、拒绝位置上报。
+    恢复时把整段暂停时长（``now - paused_at``）顺延到所有参与者的最后
+    上报时间上——等价于暂停前每个人剩余的在线时长原样延续：暂停前仍
+    活跃者恢复后继续消耗同样的剩余时长；暂停前已超时离线者依然离线，
+    不会因暂停/恢复而被重新激活。
+    """
+    now = _now()
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        room = _get_room(conn, room_id)
+
+        currently_paused = bool(room["paused"])
+        if payload.paused == currently_paused:
+            # 状态一致：幂等返回当前状态，不增版
+            conn.rollback()  # 只读，无写入
+            return _state_payload(conn, room, now)
+
+        if payload.expected_clock_version != room["clock_version"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"时钟版本不匹配: expected_clock_version="
+                    f"{payload.expected_clock_version}, 当前 clock_version="
+                    f"{room['clock_version']}"
+                ),
+            )
+
+        if payload.paused:
+            # ---- 暂停：记录暂停时刻，时钟版本递增 ----
+            conn.execute(
+                "UPDATE rooms SET paused = 1, paused_at = ?, clock_version = ? WHERE id = ?",
+                (now, room["clock_version"] + 1, room_id),
+            )
+        else:
+            # ---- 恢复：扣除整段暂停时长，时钟版本递增 ----
+            pause_duration = max(0.0, now - room["paused_at"])
+            conn.execute(
+                "UPDATE participants SET last_seen_at = last_seen_at + ? WHERE room_id = ?",
+                (pause_duration, room_id),
+            )
+            conn.execute(
+                "UPDATE rooms SET paused = 0, paused_at = NULL, clock_version = ? WHERE id = ?",
+                (room["clock_version"] + 1, room_id),
+            )
+        conn.commit()
+
+        fresh_room = _get_room(conn, room_id)
+        return _state_payload(conn, fresh_room, now)
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

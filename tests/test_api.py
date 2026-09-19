@@ -456,3 +456,179 @@ def test_revision_exposed_in_room_lines_and_state(client):
     assert client.get(f"/rooms/{room_id}").json()["revision"] == 2
     assert lines(client, room_id)["revision"] == 2
     assert state(client, room_id)["revision"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 排练暂停/恢复（PUT /rooms/{room_id}/clock）
+# ---------------------------------------------------------------------------
+
+def clock(client, room_id, expected_clock_version, paused):
+    return client.put(f"/rooms/{room_id}/clock", json={
+        "expected_clock_version": expected_clock_version,
+        "paused": paused,
+    })
+
+
+def test_clock_pause_resume_versioning_and_state_fields(client):
+    room_id = make_room(client)
+
+    # 初始：未暂停、clock_version=0、paused_at=None
+    initial = state(client, room_id)
+    assert initial["paused"] is False
+    assert initial["clock_version"] == 0
+    assert initial["paused_at"] is None
+
+    # 暂停：版本 0 → 1，记录 paused_at
+    pause_at = client.clock.t
+    resp = clock(client, room_id, 0, True)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["paused"] is True
+    assert body["clock_version"] == 1
+    assert body["paused_at"] == pause_at
+
+    client.clock.advance(5)
+
+    # 恢复：版本 1 → 2，paused_at 清空
+    resp = clock(client, room_id, 1, False)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["paused"] is False
+    assert body["clock_version"] == 2
+    assert body["paused_at"] is None
+
+
+def test_clock_same_state_is_idempotent_and_does_not_bump_version(client):
+    room_id = make_room(client)
+
+    # 未暂停时再请求“恢复”：返回当前状态且不增版
+    resp = clock(client, room_id, 0, False)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["paused"] is False
+    assert body["clock_version"] == 0
+
+    clock(client, room_id, 0, True)
+    client.clock.advance(5)
+    # 暂停中再请求“暂停”（哪怕版本号已过期）：同样幂等返回、不增版
+    resp = clock(client, room_id, 0, True)
+    assert resp.status_code == 200
+    assert resp.json()["paused"] is True
+    assert resp.json()["clock_version"] == 1
+    assert resp.json()["paused_at"] is not None
+
+
+def test_clock_version_mismatch_returns_409_and_keeps_state(client):
+    room_id = make_room(client)
+    clock(client, room_id, 0, True)  # clock_version 现在为 1
+
+    # 用过期版本请求恢复 → 409，房间仍暂停，版本不变
+    resp = clock(client, room_id, 0, False)
+    assert resp.status_code == 409
+    current = state(client, room_id)
+    assert current["paused"] is True
+    assert current["clock_version"] == 1
+
+    # 用正确版本恢复成功
+    assert clock(client, room_id, 1, False).status_code == 200
+    # 再次用过期版本请求暂停 → 409，仍为运行中
+    resp = clock(client, room_id, 0, True)
+    assert resp.status_code == 409
+    current = state(client, room_id)
+    assert current["paused"] is False
+    assert current["clock_version"] == 2
+
+
+def test_paused_room_rejects_event_reports_with_409(client):
+    room_id = make_room(client, threshold=2, timeout=10)
+    report(client, room_id, "actor-a", 1, 4)
+
+    clock(client, room_id, 0, True)
+    client.clock.advance(100)  # 暂停远超超时
+
+    # 任何位置上报（包括本会推进的上报）都被拒绝
+    resp = report(client, room_id, "actor-b", 1, 4)
+    assert resp.status_code == 409, resp.text
+    # 重复/重试上报同样被拒
+    resp = report(client, room_id, "actor-a", 1, 4)
+    assert resp.status_code == 409
+
+    current = state(client, room_id)
+    assert current["paused"] is True
+    # 暂停期间没有产生任何推进，也没有新成员
+    assert current["public_position"] == -1
+    assert [p["participant_id"] for p in current["active_participants"]] == ["actor-a"]
+
+
+def test_pause_freezes_timeout_and_resume_continues_remaining_time(client):
+    room_id = make_room(client, threshold=1, timeout=10)
+    # actor-a 在 t0 上报，此时剩余在线 10 秒
+    report(client, room_id, "actor-a", 1, 0)
+
+    # 5 秒后暂停（剩余在线 5 秒）
+    client.clock.advance(5)
+    clock(client, room_id, 0, True)
+
+    # 暂停很久：超时判定冻结，成员始终保持活跃
+    client.clock.advance(100)
+    frozen = state(client, room_id)
+    assert [p["participant_id"] for p in frozen["active_participants"]] == ["actor-a"]
+
+    # 恢复：暂停前剩余的 5 秒在线时长原样延续
+    clock(client, room_id, 1, False)
+    assert [p["participant_id"] for p in state(client, room_id)["active_participants"]] == ["actor-a"]
+    client.clock.advance(4)
+    assert [p["participant_id"] for p in state(client, room_id)["active_participants"]] == ["actor-a"]
+    client.clock.advance(2)  # 恢复后累计 6 秒 > 剩余 5 秒：此时才离线
+    assert state(client, room_id)["active_participants"] == []
+
+
+def test_resume_does_not_reactivate_already_offline_members(client):
+    room_id = make_room(client, threshold=2, timeout=10)
+    report(client, room_id, "actor-a", 1, 0)
+
+    # actor-a 超过超时未上报后离线
+    client.clock.advance(15)
+    assert state(client, room_id)["active_participants"] == []
+
+    # 离线之后才暂停、再恢复，暂停时长不得把离线者“顺延”回活跃集合
+    clock(client, room_id, 0, True)
+    client.clock.advance(100)
+    clock(client, room_id, 1, False)
+    assert state(client, room_id)["active_participants"] == []
+
+    # 且暂停前后凑齐两人的推进从未发生，公共位置保持 -1
+    assert state(client, room_id)["public_position"] == -1
+
+
+def test_pause_resume_preserves_advancements_and_revision_semantics(client):
+    room_id = make_room(client, threshold=2)
+    report(client, room_id, "actor-a", 1, 1)
+    report(client, room_id, "actor-b", 1, 1)
+
+    # 暂停期间仍可做台本修订（revision 与 clock_version 互不影响）
+    clock(client, room_id, 0, True)
+    resp = patch_lines(client, room_id, 1, [
+        {"op": "insert", "position": 0, "text": "导演：开机。"},
+    ])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["revision"] == 2
+
+    # 推进历史不被暂停/恢复影响
+    before = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    client.clock.advance(30)
+    clock(client, room_id, 1, False)
+    after = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    assert after == before
+
+    # 恢复后排练可正常推进
+    resp = report(client, room_id, "actor-a", 2, 4)
+    resp = report(client, room_id, "actor-b", 2, 4)
+    assert state(client, room_id)["public_position"] == 4
+    history = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    # 修订不重写历史（旧推进位置保持 1），恢复后新增推进到 4
+    assert [a["position"] for a in history] == [1, 4]
+
+
+def test_clock_unknown_room_returns_404(client):
+    assert clock(client, "nope", 0, True).status_code == 404

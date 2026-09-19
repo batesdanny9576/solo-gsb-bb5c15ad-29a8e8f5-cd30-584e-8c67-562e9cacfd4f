@@ -3,8 +3,10 @@
 基于 **Python + FastAPI + SQLite** 的排练提词同步服务：房间导入有序台词并设置
 **推进人数** 与 **离线超时**；演员上报参与者 ID、单调递增事件序号和已到达的
 台词位置；服务幂等处理重复或乱序上报，公共位置只推进到达到指定人数的最高台词
-且 **绝不回退**；超时参与者自动退出推进人数计算。台本支持 **带版本号的增量
-修订**：按当前行号执行 insert/replace/delete，整批原子生效，参与者与公共位置
+且 **绝不回退**；超时参与者自动退出推进人数计算。排练可 **暂停/恢复**
+（基于时钟版本的乐观并发控制）：暂停期间冻结超时判定并拒绝位置上报，恢复时
+扣除整段暂停时长，剩余在线时长原样延续。台本支持 **带版本号的增量修订**：
+按当前行号执行 insert/replace/delete，整批原子生效，参与者与公共位置
 按台词身份自动重排。
 
 ## 快速启动（单条命令）
@@ -65,6 +67,16 @@ curl -X PATCH http://localhost:8000/rooms/demo/lines \
 
 # 6. 台词与状态都会携带当前 revision；以过期 base_revision 修订将返回 409
 curl http://localhost:8000/rooms/demo/lines
+
+# 7. 暂停排练（携带当前 clock_version）：冻结超时判定，期间位置上报返回 409
+curl -X PUT http://localhost:8000/rooms/demo/clock \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_clock_version":0,"paused":true}'
+
+# 8. 恢复排练：扣除整段暂停时长，暂停前剩余在线时长原样延续
+curl -X PUT http://localhost:8000/rooms/demo/clock \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_clock_version":1,"paused":false}'
 ```
 
 ## API 一览
@@ -76,8 +88,9 @@ curl http://localhost:8000/rooms/demo/lines
 | POST   | `/rooms/{room_id}/lines`        | 导入有序台词（整体替换，重置进度并开启新版本） |
 | GET    | `/rooms/{room_id}/lines`        | 查看台词（含当前 `revision`）              |
 | PATCH  | `/rooms/{room_id}/lines`        | 台本增量修订（版本校验 + 整批原子生效）    |
-| POST   | `/rooms/{room_id}/events`       | 演员上报位置（幂等）                       |
-| GET    | `/rooms/{room_id}/state`        | 当前活跃成员、公共位置、最近一次推进原因   |
+| POST   | `/rooms/{room_id}/events`       | 演员上报位置（幂等；暂停期间 409） |
+| GET    | `/rooms/{room_id}/state`        | 当前活跃成员、公共位置、最近一次推进原因（含暂停/时钟状态） |
+| PUT    | `/rooms/{room_id}/clock`        | 暂停/恢复排练（`expected_clock_version` 乐观并发控制） |
 | GET    | `/rooms/{room_id}/advancements` | 完整推进历史（含每次推进原因）             |
 | GET    | `/health`                       | 健康检查                                   |
 
@@ -92,6 +105,18 @@ curl http://localhost:8000/rooms/demo/lines
   都不会使公共位置下降。
 - **离线超时**：超过超时未上报的参与者退出活跃成员列表与推进人数计算；
   重新上报后自动回到活跃集合。
+- **排练暂停/恢复**：`PUT /rooms/{room_id}/clock` 提交 `expected_clock_version`
+  与 `paused`：
+  - 目标状态与当前一致时返回当前状态且 **不增版**（重复请求安全）；目标状态
+    不同但版本不符返回 **409**、状态不变；成功切换后 `clock_version` 递增；
+  - **暂停**：记录 `paused_at`，冻结活跃成员的超时判定（暂停再久也不会有人
+    超时离线），并拒绝一切位置上报（返回 **409**，含重复上报）；
+  - **恢复**：把整段暂停时长（`now - paused_at`）顺延到所有参与者的最后
+    上报时间上，暂停前剩余的在线时长 **原样延续**；暂停前已超时离线的成员
+    依然离线，**不会被重新激活**（只有本人重新上报才能回到活跃集合）；
+  - `GET /state` 返回 `paused`、`clock_version`、`paused_at`（恢复后为
+    `null`）；台本 `revision` 与时钟 `clock_version` 相互独立，暂停期间仍可
+    修订台本，推进历史也不因暂停/恢复而改变。
 - **推进原因**：每次推进记录促成的参与者名单与可读原因，可在
   `/state`（最近一次）与 `/advancements`（全部历史）中查询。
 - **台本版本（revision）**：房间创建时为 0，每次整体导入或增量修订后递增；

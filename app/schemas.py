@@ -73,3 +73,12 @@ class LinesPatch(BaseModel):
         ge=0, description="客户端基于的台本版本；与当前版本不一致时返回 409"
     )
     operations: List[LineOperation] = Field(min_length=1)
+
+
+class ClockUpdate(BaseModel):
+    """排练暂停/恢复：基于时钟版本做乐观并发控制。"""
+
+    expected_clock_version: int = Field(
+        ge=0, description="客户端基于的时钟版本；目标状态与当前不同且版本不符时返回 409"
+    )
+    paused: bool = Field(description="True 暂停排练，False 恢复排练")

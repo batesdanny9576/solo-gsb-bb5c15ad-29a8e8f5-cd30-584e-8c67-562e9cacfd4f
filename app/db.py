@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS rooms (
     offline_timeout_seconds INTEGER NOT NULL CHECK (offline_timeout_seconds >= 1),
     public_position        INTEGER NOT NULL DEFAULT -1,
     revision               INTEGER NOT NULL DEFAULT 0,
+    paused                 INTEGER NOT NULL DEFAULT 0,  -- 是否处于排练暂停
+    clock_version          INTEGER NOT NULL DEFAULT 0,  -- 排练时钟版本：每次暂停/恢复递增
+    paused_at              REAL,                        -- 本次暂停开始的 epoch 秒；恢复后为 NULL
     created_at             REAL NOT NULL
 );
 
@@ -77,9 +80,23 @@ def init_db() -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """对已存在的旧库幂等补齐后加的列（rooms.revision：台本版本号）。"""
+    """对已存在的旧库幂等补齐后加的列。
+
+    - rooms.revision：台本版本号
+    - rooms.paused / clock_version / paused_at：排练暂停/恢复时钟
+    """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(rooms)")}
     if "revision" not in columns:
         conn.execute(
             "ALTER TABLE rooms ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
         )
+    if "paused" not in columns:
+        conn.execute(
+            "ALTER TABLE rooms ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
+        )
+    if "clock_version" not in columns:
+        conn.execute(
+            "ALTER TABLE rooms ADD COLUMN clock_version INTEGER NOT NULL DEFAULT 0"
+        )
+    if "paused_at" not in columns:
+        conn.execute("ALTER TABLE rooms ADD COLUMN paused_at REAL")
