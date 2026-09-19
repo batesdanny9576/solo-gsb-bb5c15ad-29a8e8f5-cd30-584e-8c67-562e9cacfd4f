@@ -456,3 +456,245 @@ def test_revision_exposed_in_room_lines_and_state(client):
     assert client.get(f"/rooms/{room_id}").json()["revision"] == 2
     assert lines(client, room_id)["revision"] == 2
     assert state(client, room_id)["revision"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 排练暂停/恢复（PUT /rooms/{room_id}/clock）
+# ---------------------------------------------------------------------------
+
+def set_clock(client, room_id, expected_clock_version, paused):
+    return client.put(f"/rooms/{room_id}/clock", json={
+        "expected_clock_version": expected_clock_version,
+        "paused": paused,
+    })
+
+
+def pause(client, room_id, expected=0):
+    return set_clock(client, room_id, expected, True)
+
+
+def resume(client, room_id, expected=1):
+    return set_clock(client, room_id, expected, False)
+
+
+def active_ids(client, room_id):
+    return [p["participant_id"] for p in state(client, room_id)["active_participants"]]
+
+
+def test_state_exposes_clock_fields_for_running_room(client):
+    room_id = make_room(client)
+    current = state(client, room_id)
+    assert current["paused"] is False
+    assert current["clock_version"] == 0
+    assert current["paused_at"] is None
+
+
+def test_pause_freezes_timeout_judgement(client):
+    room_id = make_room(client, threshold=1, timeout=10)
+    report(client, room_id, "actor-a", 1, 4)
+
+    client.clock.advance(5)
+    resp = pause(client, room_id, expected=0)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["changed"] is True
+    assert body["paused"] is True
+    assert body["clock_version"] == 1
+    assert body["paused_at"] == client.clock.t
+    assert body["state"]["paused"] is True
+
+    # 暂停远超超时窗口：成员依旧活跃，冻结在暂停瞬间的集合上
+    client.clock.advance(1000)
+    current = state(client, room_id)
+    assert current["paused"] is True
+    assert current["clock_version"] == 1
+    assert current["paused_at"] == client.clock.t - 1000
+    assert active_ids(client, room_id) == ["actor-a"]
+
+
+def test_events_rejected_while_paused(client):
+    room_id = make_room(client, threshold=1, timeout=10)
+    report(client, room_id, "actor-a", 1, 4)
+    pause(client, room_id)
+
+    client.clock.advance(5)
+    # 暂停期间一切位置上报均被拒绝
+    resp = report(client, room_id, "actor-a", 2, 4)
+    assert resp.status_code == 409, resp.text
+    # 新参与者同样无法在暂停期间加入
+    resp = report(client, room_id, "actor-b", 1, 4)
+    assert resp.status_code == 409
+
+    # 拒绝不产生任何状态变化
+    current = state(client, room_id)
+    assert active_ids(client, room_id) == ["actor-a"]
+    assert current["active_participants"][0]["last_seq"] == 1
+    assert current["public_position"] == 4
+
+
+def test_resume_subtracts_full_pause_duration(client):
+    room_id = make_room(client, threshold=1, timeout=10)
+    report(client, room_id, "actor-a", 1, 4)
+    client.clock.advance(5)           # 暂停前剩余在线时长 5 秒
+    pause(client, room_id)
+    client.clock.advance(1000)        # 暂停多久都不计入在线时长
+
+    resp = resume(client, room_id, expected=1)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["changed"] is True
+    assert body["paused"] is False
+    assert body["clock_version"] == 2
+    assert body["paused_at"] is None
+
+    # 恢复瞬间成员仍活跃；再等 4 秒（剩余 5 - 4）仍在线
+    client.clock.advance(4)
+    assert active_ids(client, room_id) == ["actor-a"]
+
+    # 再等 2 秒：累计超过暂停前剩余的 5 秒，正常离线
+    client.clock.advance(2)
+    assert active_ids(client, room_id) == []
+
+
+def test_already_offline_members_are_not_reactivated_on_resume(client):
+    room_id = make_room(client, threshold=1, timeout=10)
+    report(client, room_id, "actor-a", 1, 4)
+
+    # actor-a 在暂停前就已离线
+    client.clock.advance(11)
+    assert active_ids(client, room_id) == []
+
+    pause(client, room_id)
+    client.clock.advance(1000)
+    resume(client, room_id, expected=1)
+
+    # 扣除暂停时长后：1011 - 1000 = 11 > 10，离线成员不得被重新激活
+    assert active_ids(client, room_id) == []
+    current = state(client, room_id)
+    assert current["paused"] is False
+    assert current["clock_version"] == 2
+
+
+def test_idempotent_pause_and_resume_do_not_bump_version(client):
+    room_id = make_room(client)
+    pause(client, room_id)
+    paused_at_first = state(client, room_id)["paused_at"]
+
+    # 重复暂停（即使携带过期版本号）：目标一致，直接返回当前状态且不增版
+    resp = set_clock(client, room_id, 0, True)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["changed"] is False
+    assert body["clock_version"] == 1
+    assert body["paused_at"] == paused_at_first
+
+    client.clock.advance(30)
+    # 幂等暂停不刷新 paused_at：冻结时刻保持不变
+    assert state(client, room_id)["paused_at"] == paused_at_first
+
+    resume(client, room_id, expected=1)
+    # 重复恢复同样不增版
+    resp = set_clock(client, room_id, 1, False)
+    assert resp.status_code == 200
+    assert resp.json()["changed"] is False
+    assert resp.json()["clock_version"] == 2
+
+
+def test_clock_version_mismatch_returns_409_and_keeps_state(client):
+    room_id = make_room(client)
+    pause(client, room_id)  # clock_version -> 1
+
+    # 以过期版本恢复：409，房间保持暂停
+    resp = resume(client, room_id, expected=0)
+    assert resp.status_code == 409, resp.text
+    current = state(client, room_id)
+    assert current["paused"] is True
+    assert current["clock_version"] == 1
+
+    # 暂停仍在生效：上报继续被拒
+    assert report(client, room_id, "actor-a", 1, 0).status_code == 409
+
+    # 正确版本恢复成功，clock_version 递增
+    assert resume(client, room_id, expected=1).status_code == 200
+    current = state(client, room_id)
+    assert current["paused"] is False
+    assert current["clock_version"] == 2
+
+    # 运行中再以过期版本暂停：409，状态不变
+    resp = pause(client, room_id, expected=1)
+    assert resp.status_code == 409
+    assert state(client, room_id)["paused"] is False
+    assert state(client, room_id)["clock_version"] == 2
+
+
+def test_clock_unknown_room_returns_404(client):
+    assert set_clock(client, "nope", 0, True).status_code == 404
+
+
+def test_clock_state_is_independent_of_script_revision(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 4)
+    pause(client, room_id)
+
+    # 暂停期间台本整体导入：重置进度并递增 revision，但不改变暂停状态
+    client.clock.advance(100)
+    resp = client.post(f"/rooms/{room_id}/lines", json={"lines": ["新台词一", "新台词二"]})
+    assert resp.status_code == 200
+    current = state(client, room_id)
+    assert current["revision"] == 2
+    assert current["paused"] is True
+    assert current["clock_version"] == 1
+    # 暂停期间依然拒绝上报
+    assert report(client, room_id, "actor-a", 1, 0).status_code == 409
+
+    # 恢复后按整段暂停时长扣减，导入清空了参与者，可正常重新上报
+    resume(client, room_id, expected=1)
+    assert report(client, room_id, "actor-a", 1, 1).status_code == 200
+
+    # 增量修订同样不影响时钟版本
+    set_clock(client, room_id, 2, True)
+    patch_resp = patch_lines(client, room_id, 2, [
+        {"op": "insert", "position": 0, "text": "导演：开机。"},
+    ])
+    assert patch_resp.status_code == 200
+    current = state(client, room_id)
+    assert current["revision"] == 3
+    assert current["paused"] is True
+    assert current["clock_version"] == 3
+
+
+def test_pause_resume_preserves_advancement_history(client):
+    room_id = make_room(client, threshold=2)
+    report(client, room_id, "actor-a", 1, 2)
+    report(client, room_id, "actor-b", 1, 2)
+    before = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    assert [a["position"] for a in before] == [2]
+
+    pause(client, room_id)
+    client.clock.advance(60)
+    resume(client, room_id, expected=1)
+
+    # 暂停/恢复本身不产生推进记录
+    after = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    assert after == before
+
+    # 恢复后推进语义照常工作
+    client.clock.advance(1)
+    resp = report(client, room_id, "actor-a", 2, 4)
+    assert resp.status_code == 200  # 单人力推进时也正常；此处阈值 2
+    report(client, room_id, "actor-b", 2, 4)
+    history = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    assert [a["position"] for a in history] == [2, 4]
+
+
+def test_resume_with_zero_length_pause(client):
+    room_id = make_room(client, threshold=1, timeout=10)
+    report(client, room_id, "actor-a", 1, 4)
+    pause(client, room_id)
+    # 立刻恢复：暂停时长为 0，成员仍按正常超时规则计时
+    resume(client, room_id, expected=1)
+    assert active_ids(client, room_id) == ["actor-a"]
+    client.clock.advance(10)
+    assert active_ids(client, room_id) == ["actor-a"]
+    client.clock.advance(1)
+    assert active_ids(client, room_id) == []
